@@ -2,8 +2,12 @@
 
 A bed-presence alarm. At the alarm time it rings only if you're in bed. It keeps ringing while you're in bed, goes quiet when you get up, and stops for good once the bed has been empty for a few minutes. Getting back in bed starts it ringing again.
 
-- `firmware/WakeBed/WakeBed.ino`: Arduino sketch for the M5Stack AtomS3 Lite, the M5Stack Weight Unit (HX711) on the Atom's Grove port, and a passive buzzer on PortABC Port B.
+- `firmware/WakeBed/WakeBed.ino`: Arduino sketch for the M5Stack AtomS3 Lite, the M5Stack Weight Unit (HX711) on the Atom's Grove port, a passive buzzer on PortABC Port B, and (optional) the M5Stack RTC Unit (HYM8563) on PortABC Port A.
 - `docs/index.html`: control page using Web Bluetooth. It needs Chrome on Android or desktop, and is served by GitHub Pages from `/docs`.
+
+## Clock
+
+With the RTC Unit plugged in, the clock survives power cuts and reboots: the Atom reads the time from the RTC at boot, and every phone connection writes the phone's time back to it. Its pins are auto-detected at boot (`RTC found on G../G..` in the Serial Monitor). Without the RTC, the time is lost on power-off until the page connects again.
 
 ## Flashing
 
@@ -17,7 +21,7 @@ Commands can be sent over BLE or typed in the Serial Monitor at 115200 baud. Sep
 
 | Command | Effect |
 |---|---|
-| `status` | print state, signal and settings |
+| `status` | print state, signal, settings, RTC state and RTC-vs-system drift |
 | `tare` | record the current reading as "bed empty" |
 | `test=3` | ring for 3 s |
 | `sim=15` | simulate the alarm in 15 s |

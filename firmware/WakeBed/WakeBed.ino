@@ -3,6 +3,7 @@
 // Hardware (same as bed_sensor_test.ino):
 //   - Weight Unit (HX711) on the Atom's own Grove port  -> HX_DOUT / HX_SCK
 //   - Passive buzzer on PortABC Port B                  -> BUZZER_PIN
+//   - RTC Unit (HYM8563) on PortABC Port A (optional)   -> auto-detected
 //   - Built-in button (GPIO 41) and RGB LED (GPIO 35)
 //
 // Control: Bluetooth LE. Open the WakeBed control page in Chrome (Android or
@@ -26,6 +27,7 @@
 #include <NimBLEDevice.h>
 #include <time.h>
 #include <sys/time.h>
+#include <Wire.h>
 #include "HX711.h"
 
 // ---------------- Pins (keep whatever worked in bed_sensor_test) -------------
@@ -37,6 +39,14 @@ const int LED_PIN    = 35;   // AtomS3 Lite RGB LED; set to -1 to disable
 
 // Local time zone (Switzerland, with daylight saving)
 const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
+
+// RTC Unit (HYM8563) on PortABC Port A. Leave RTC_SDA/RTC_SCL at -1 to
+// auto-detect: the candidate pin pairs below are probed at boot. If you read
+// the pins off the PortABC sticker, you can put them here instead
+// (yellow wire = SDA, white = SCL).
+int RTC_SDA = -1;
+int RTC_SCL = -1;
+const int RTC_CANDIDATES[][2] = { {38, 39}, {39, 38}, {5, 6}, {6, 5} };
 
 // ---------------- BLE UUIDs (must match the web page) ------------------------
 #define SVC_UUID  "6e7a0001-3c5b-4f0e-9a51-7b2d1c0e4a10"
@@ -145,6 +155,100 @@ void event(const String& msg) {
   }
 }
 
+// ---------------- RTC (HYM8563 / PCF8563-compatible, I2C 0x51) --------------
+// The RTC stores UTC. Registers 0x02..0x08 = sec, min, hour, day, weekday,
+// month, year, all BCD. Bit 7 of the seconds register (VL) is set when the
+// chip lost power and the time can't be trusted.
+const uint8_t RTC_ADDR = 0x51;
+enum RtcState { RTC_NONE = 0, RTC_OK = 1, RTC_LOST = 2 };
+RtcState rtcState = RTC_NONE;
+
+static uint8_t bcd2bin(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+static uint8_t bin2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+// Days since 1970-01-01 for a civil date (proleptic Gregorian)
+static long daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const long era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (long)doe - 719468;
+}
+
+bool rtcProbe() {
+  Wire.beginTransmission(RTC_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
+bool rtcFind() {
+  if (RTC_SDA >= 0) {
+    Wire.begin(RTC_SDA, RTC_SCL, 100000);
+    return rtcProbe();
+  }
+  for (auto& p : RTC_CANDIDATES) {
+    Wire.begin(p[0], p[1], 100000);
+    if (rtcProbe()) { RTC_SDA = p[0]; RTC_SCL = p[1]; return true; }
+    Wire.end();
+  }
+  return false;
+}
+
+// Reads the RTC; returns Unix time (UTC), or 0 if missing/invalid
+time_t rtcRead() {
+  Wire.beginTransmission(RTC_ADDR);
+  Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return 0;
+  if (Wire.requestFrom((int)RTC_ADDR, 7) != 7) return 0;
+  uint8_t r[7];
+  for (int i = 0; i < 7; i++) r[i] = Wire.read();
+  if (r[0] & 0x80) { rtcState = RTC_LOST; return 0; }   // VL: clock stopped at some point
+  int sec  = bcd2bin(r[0] & 0x7F);
+  int min  = bcd2bin(r[1] & 0x7F);
+  int hour = bcd2bin(r[2] & 0x3F);
+  int day  = bcd2bin(r[3] & 0x3F);
+  int mon  = bcd2bin(r[5] & 0x1F);
+  int year = 2000 + bcd2bin(r[6]);
+  if (year < 2024 || mon < 1 || mon > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59) {
+    rtcState = RTC_LOST; return 0;
+  }
+  rtcState = RTC_OK;
+  return (time_t)daysFromCivil(year, mon, day) * 86400 + hour * 3600 + min * 60 + sec;
+}
+
+bool rtcWrite(time_t t) {
+  if (RTC_SDA < 0) return false;
+  struct tm g; gmtime_r(&t, &g);
+  Wire.beginTransmission(RTC_ADDR);
+  Wire.write(0x00);
+  Wire.write(0x00);                       // control 1: clock running
+  Wire.write(0x00);                       // control 2: no alarms/interrupts
+  Wire.write(bin2bcd(g.tm_sec));          // also clears the VL flag
+  Wire.write(bin2bcd(g.tm_min));
+  Wire.write(bin2bcd(g.tm_hour));
+  Wire.write(bin2bcd(g.tm_mday));
+  Wire.write(g.tm_wday);
+  Wire.write(bin2bcd(g.tm_mon + 1));
+  Wire.write(bin2bcd(g.tm_year % 100));
+  bool ok = Wire.endTransmission() == 0;
+  if (ok) rtcState = RTC_OK;
+  return ok;
+}
+
+void rtcInit() {
+  if (!rtcFind()) { rtcState = RTC_NONE; event("RTC not found: time comes from the phone only"); return; }
+  time_t t = rtcRead();
+  if (t) {
+    struct timeval tv = { t, 0 };
+    settimeofday(&tv, nullptr);
+    event("RTC found on G" + String(RTC_SDA) + "/G" + String(RTC_SCL) + ": clock restored");
+  } else {
+    event("RTC found on G" + String(RTC_SDA) + "/G" + String(RTC_SCL) + " but its time is invalid: connect the phone once");
+  }
+}
+
+const char* rtcName() { return rtcState == RTC_OK ? "ok" : rtcState == RTC_LOST ? "lost" : "none"; }
+
 String configString() {
   char buf[200];
   snprintf(buf, sizeof buf,
@@ -224,6 +328,11 @@ String statusLine() {
     strftime(ts, sizeof ts, "%a %H:%M:%S", localtime(&now));
     s += " time=" + String(ts);
   } else s += " time=unset";
+  s += " rtc=" + String(rtcName());
+  if (rtcState == RTC_OK && timeValid()) {
+    time_t r = rtcRead();
+    if (r) s += " rtcDiff=" + String((long)(r - time(nullptr))) + "s";
+  }
   s += " cfg=" + configString();
   return s;
 }
@@ -243,7 +352,8 @@ void handleCommand(String c) {
   if (k == "time") {                      // time=<unix seconds, UTC>
     struct timeval tv = { (time_t)strtoll(v.c_str(), nullptr, 10), 0 };
     settimeofday(&tv, nullptr);
-    event("Time set");
+    if (RTC_SDA >= 0) event(rtcWrite(tv.tv_sec) ? "Time set (saved to RTC)" : "Time set (RTC write failed)");
+    else event("Time set");
   } else if (k == "alarm") {              // alarm=HH:MM
     int h = v.substring(0, 2).toInt(), m = v.substring(3, 5).toInt();
     setKey("ah", h); setKey("am", m); saveConfig();
@@ -419,6 +529,8 @@ void setup() {
   buzzerInit();
   buzzerSet(0);
 
+  rtcInit();
+
   cmdQueue = xQueueCreate(8, sizeof(CmdMsg));
   bleInit();
   event("WakeBed started" + String(haveEmpty ? " (saved empty level)" : " (will tare: keep bed empty)"));
@@ -442,15 +554,15 @@ void loop() {
   checkButton();
   driveLed();
 
-  // Live data ~5 Hz: delta,occupied,state,raw,secondsEmpty,sessionSeconds,epoch
+  // Live data ~5 Hz: delta,occupied,state,raw,secondsEmpty,sessionSeconds,epoch,rtc(0 none/1 ok/2 lost)
   static unsigned long lastLive = 0;
   if (millis() - lastLive >= 200) {
     lastLive = millis();
     char buf[96];
     unsigned long se = (state == RINGING_SESSION && emptySinceMs) ? (millis() - emptySinceMs) / 1000 : 0;
     unsigned long ss = state == RINGING_SESSION ? (millis() - sessionStartMs) / 1000 : 0;
-    snprintf(buf, sizeof buf, "%ld,%d,%d,%ld,%lu,%lu,%ld",
-             delta, occupied, (int)state, rawFilt, se, ss, (long)(timeValid() ? time(nullptr) : 0));
+    snprintf(buf, sizeof buf, "%ld,%d,%d,%ld,%lu,%lu,%ld,%d",
+             delta, occupied, (int)state, rawFilt, se, ss, (long)(timeValid() ? time(nullptr) : 0), (int)rtcState);
     liveChr->setValue(buf);
     if (bleConnected) liveChr->notify();
   }

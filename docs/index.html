@@ -104,6 +104,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         <dt>State</dt><dd id="sState">—</dd>
         <dt>Signal</dt><dd id="sDelta">—</dd>
         <dt>Device time</dt><dd id="sTime">—</dd>
+        <dt>Clock unit</dt><dd id="sRtc">—</dd>
         <dt>Next alarm</dt><dd id="sNext">—</dd>
       </dl>
     </div>
@@ -266,7 +267,7 @@ function setConn(text, on) { const p = $("conn"); p.textContent = text; p.classL
 
 // ---------- live data ----------
 function onLive(s) {
-  const [delta, occ, state, raw, emptySec, sessSec, epoch] = s.split(",").map(Number);
+  const [delta, occ, state, raw, emptySec, sessSec, epoch, rtc] = s.split(",").map(Number);
   last = { delta, occ, state, raw, emptySec, sessSec, epoch };
   const now = performance.now();
   hist.push({ t: now, d: Math.abs(delta) });
@@ -283,6 +284,7 @@ function onLive(s) {
   }
   $("sTime").textContent = epoch ? new Date(epoch * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "not set";
   $("sNext").textContent = nextAlarmText();
+  $("sRtc").textContent = rtc === 1 ? "OK (keeps time without power)" : rtc === 2 ? "Found, time was lost (fixed on connect)" : "Not connected";
 }
 function fmtDur(s) { const m = Math.floor(s / 60); return m ? `${m} min ${s % 60} s` : `${s} s`; }
 function nextAlarmText() {
